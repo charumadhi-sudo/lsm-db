@@ -1,50 +1,56 @@
 package com.lsmdb.sstable;
 
-import java.io.*;
+import java.io.Closeable;
+import java.io.File;
+import java.io.IOException;
+import java.io.RandomAccessFile;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 
+import com.lsmdb.bloom.BloomFilter;
+
 /**
  * Reads an immutable SSTable file, supporting point lookups (get) via
- * the sparse index — WITHOUT loading the whole data block into memory.
- *
- * Only the (small) sparse index is loaded into RAM on open(); the data
- * block is read via seek()s directly against the file on disk, entry by
- * entry, only for the small range a lookup actually needs.
+ * a bloom filter (cheap "definitely absent?" check) plus the sparse
+ * index (binary search + seek + short scan) for everything else.
  */
 public class SSTableReader implements Closeable {
 
     private final RandomAccessFile file;
     private final List<SSTableWriter.IndexEntry> index; // sorted by key, in RAM
-    private final long indexBlockOffset; // remembered once at open(), not re-read per lookup
+    private final long bloomFilterOffset; // == where the data block ends
+    private final BloomFilter bloomFilter;
 
-    private SSTableReader(RandomAccessFile file, List<SSTableWriter.IndexEntry> index, long indexBlockOffset) {
+    private SSTableReader(RandomAccessFile file, List<SSTableWriter.IndexEntry> index,
+                           long bloomFilterOffset, BloomFilter bloomFilter) {
         this.file = file;
         this.index = index;
-        this.indexBlockOffset = indexBlockOffset;
+        this.bloomFilterOffset = bloomFilterOffset;
+        this.bloomFilter = bloomFilter;
     }
 
-    /**
-     * Opens an SSTable file and loads its (small) sparse index into
-     * memory, ready for lookups. Does NOT read the data block yet.
-     */
     public static SSTableReader open(File sstableFile) throws IOException {
         RandomAccessFile raf = new RandomAccessFile(sstableFile, "r");
 
-        // Footer is always the LAST 12 bytes: [offset:8][count:4].
-        // This is the one fixed, known location in an otherwise
-        // variable-length file — that's precisely why we designed it
-        // that way in SSTableWriter.
+        // Footer is always the LAST 20 bytes:
+        // [bloomFilterOffset:8][indexBlockOffset:8][indexEntryCount:4]
         long fileLength = raf.length();
-        raf.seek(fileLength - 12);
+        raf.seek(fileLength - 20);
+        long bloomFilterOffset = raf.readLong();
         long indexBlockOffset = raf.readLong();
         int indexEntryCount = raf.readInt();
 
-        // Now that we know exactly where the index starts, jump there
-        // and read all indexEntryCount entries into memory. This is the
-        // ONLY part of the file we load eagerly — it's small by design
-        // (fileSize / SPARSE_INTERVAL entries), unlike the data block.
+        // --- Load the bloom filter into memory ---
+        // Its byte length is exactly the gap between where it starts
+        // and where the index block starts right after it.
+        raf.seek(bloomFilterOffset);
+        int bloomFilterByteLength = (int) (indexBlockOffset - bloomFilterOffset);
+        byte[] bloomBytes = new byte[bloomFilterByteLength];
+        raf.readFully(bloomBytes);
+        BloomFilter bloomFilter = BloomFilter.fromBytes(bloomBytes);
+
+        // --- Load the sparse index into memory ---
         raf.seek(indexBlockOffset);
         List<SSTableWriter.IndexEntry> index = new ArrayList<>(indexEntryCount);
         for (int i = 0; i < indexEntryCount; i++) {
@@ -55,42 +61,42 @@ public class SSTableReader implements Closeable {
             index.add(new SSTableWriter.IndexEntry(key, offset));
         }
 
-        return new SSTableReader(raf, index, indexBlockOffset);
+        return new SSTableReader(raf, index, bloomFilterOffset, bloomFilter);
     }
 
     /**
      * Looks up a key. Returns the raw value bytes if found (which may be
-     * the empty-array tombstone marker — caller's job to interpret),
-     * or null if the key definitely does not exist in this SSTable.
+     * the empty-array tombstone marker), or null if the key does not
+     * exist in this SSTable.
      */
     public synchronized byte[] get(byte[] key) throws IOException {
-        if (index.isEmpty()) {
-            return null; // empty SSTable, shouldn't normally happen but be safe
+        // Cheap first check: if the bloom filter says "definitely not
+        // here," skip the binary search, the seek, and the scan
+        // entirely — zero disk I/O for the data itself. This is the
+        // entire point of adding it: most lookups for a key that isn't
+        // in THIS particular file get resolved in O(k) in-memory bit
+        // checks instead of a seek + scan.
+        if (!bloomFilter.mightContain(key)) {
+            return null;
         }
 
-        // Step 1: binary search the in-memory sparse index for the
-        // LARGEST indexed key that is <= our target key. That tells us
-        // "start scanning the data block from here" — the target key,
-        // if present, cannot appear before this offset.
+        if (index.isEmpty()) {
+            return null;
+        }
+
         int startIdx = floorIndex(key);
         if (startIdx == -1) {
-            // Target key is smaller than every indexed key, meaning
-            // smaller than every key in the file at all (index entry 0
-            // is always the file's very first key) — definitely absent.
             return null;
         }
 
         long startOffset = index.get(startIdx).offset();
-
-        // Step 2: determine where to STOP scanning — either the next
-        // index entry's offset, or end-of-data-block if this is the
-        // last index entry. We must not scan into the index block itself.
+        // Upper bound for the scan: either the next index entry, or —
+        // for the LAST bucket — the point where the data block ends,
+        // which is exactly where the bloom filter block begins.
         long endOffset = (startIdx + 1 < index.size())
                 ? index.get(startIdx + 1).offset()
-                : indexBlockOffset;
+                : bloomFilterOffset;
 
-        // Step 3: linear scan the data block between those two offsets —
-        // at most SPARSE_INTERVAL entries, by construction.
         file.seek(startOffset);
         while (file.getFilePointer() < endOffset) {
             int keyLen = file.readInt();
@@ -104,20 +110,14 @@ public class SSTableReader implements Closeable {
                 file.readFully(value);
                 return value;
             } else if (cmp > 0) {
-                // Data block is sorted — once we've passed the target
-                // key, it cannot appear later. Stop early.
                 return null;
             } else {
-                // Not our key yet — skip over its value without reading
-                // it into memory, since we don't need it.
                 file.seek(file.getFilePointer() + valueLen);
             }
         }
         return null;
     }
 
-    /** Binary search for the rightmost index entry whose key <= target.
-     * Returns -1 if target is smaller than every indexed key. */
     private int floorIndex(byte[] target) {
         int lo = 0, hi = index.size() - 1, result = -1;
         while (lo <= hi) {

@@ -81,7 +81,7 @@ public class MemTable {
      * flushed to an SSTable, the tombstone must be written to disk too,
      * so it can shadow stale values sitting in older SSTables.
      */
-    public Iterable<Entry> entriesInOrder() {
+    public java.util.List<Entry> entriesInOrder() {
         java.util.List<Entry> result = new java.util.ArrayList<>();
         for (SkipListNode node : skipList.entriesInOrder()) {
             result.add(new Entry(node.key, node.value));

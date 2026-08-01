@@ -1,38 +1,49 @@
 package com.lsmdb.sstable;
 
-import com.lsmdb.storage.MemTable;
-
-import java.io.*;
+import java.io.BufferedOutputStream;
+import java.io.DataOutputStream;
+import java.io.File;
+import java.io.FileOutputStream;
+import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
+
+import com.lsmdb.bloom.BloomFilter;
+import com.lsmdb.storage.MemTable;
 
 /**
  * Writes a MemTable's sorted contents to disk as an immutable SSTable file.
  *
- * File layout (see class-level notes for the reasoning):
- *   [DATA BLOCK]   sorted entries: [keyLen:4][key][valLen:4][value] ...
- *   [INDEX BLOCK]  sparse index:   [keyLen:4][key][offset:8] ... (every Nth key)
- *   [FOOTER]       fixed 12 bytes: [indexBlockOffset:8][indexEntryCount:4]
+ * File layout:
+ *   [DATA BLOCK]         sorted entries: [keyLen:4][key][valLen:4][value] ...
+ *   [BLOOM FILTER BLOCK] serialized BloomFilter (see BloomFilter.toBytes)
+ *   [INDEX BLOCK]        sparse index: [keyLen:4][key][offset:8] ... (every Nth key)
+ *   [FOOTER]             fixed 20 bytes:
+ *                         [bloomFilterOffset:8][indexBlockOffset:8][indexEntryCount:4]
  *
- * Why the footer is fixed-size and always last: a reader opening this
- * file needs to find the index WITHOUT scanning the whole data block.
- * Jumping to (fileLength - 12) always lands exactly on the footer, which
- * then points straight at the index block's start offset.
+ * Why the bloom filter sits BETWEEN the data block and the index: order
+ * doesn't actually matter for correctness (the footer stores explicit
+ * offsets for both, so a reader never has to guess), but this ordering
+ * keeps "how do I find X" symmetric: jump to footer, read two offsets,
+ * seek directly to either block. Nothing needs to be scanned to find
+ * either one.
  */
 public class SSTableWriter {
 
-    /** Write one sparse index entry every N data entries. Tunable — a
-     * smaller interval means a bigger in-memory index but shorter linear
-     * scans per read; a bigger interval is the reverse trade. */
     private static final int SPARSE_INTERVAL = 16;
+    private static final double BLOOM_FALSE_POSITIVE_RATE = 0.01; // 1%
 
-    /**
-     * Flushes the given MemTable to a new SSTable file. The MemTable is
-     * NOT modified or cleared by this call — that's the caller's
-     * responsibility (typically: swap in a fresh MemTable once this
-     * returns successfully).
-     */
     public static void flush(MemTable memTable, File outputFile) throws IOException {
+        List<MemTable.Entry> entries = memTable.entriesInOrder();
+
+        // Build the bloom filter sized for exactly how many keys we're
+        // about to write, so its false-positive rate matches what we
+        // configured, regardless of how big or small this flush is.
+        BloomFilter bloomFilter = BloomFilter.create(entries.size(), BLOOM_FALSE_POSITIVE_RATE);
+        for (MemTable.Entry entry : entries) {
+            bloomFilter.add(entry.key());
+        }
+
         List<IndexEntry> indexEntries = new ArrayList<>();
 
         try (DataOutputStream out = new DataOutputStream(
@@ -42,29 +53,31 @@ public class SSTableWriter {
             int count = 0;
 
             // --- DATA BLOCK ---
-            for (MemTable.Entry entry : memTable.entriesInOrder()) {
-                // Every SPARSE_INTERVAL-th entry gets remembered for the
-                // index, along with the BYTE OFFSET it starts at — that
-                // offset is what lets a reader seek() straight to it later.
+            for (MemTable.Entry entry : entries) {
                 if (count % SPARSE_INTERVAL == 0) {
                     indexEntries.add(new IndexEntry(entry.key(), offset));
                 }
-
                 int written = writeEntry(out, entry.key(), entry.value());
                 offset += written;
                 count++;
             }
 
-            long indexBlockOffset = offset;
+            // --- BLOOM FILTER BLOCK ---
+            long bloomFilterOffset = offset;
+            byte[] bloomBytes = bloomFilter.toBytes();
+            out.write(bloomBytes);
+            offset += bloomBytes.length;
 
             // --- INDEX BLOCK ---
+            long indexBlockOffset = offset;
             for (IndexEntry ie : indexEntries) {
                 out.writeInt(ie.key().length);
                 out.write(ie.key());
                 out.writeLong(ie.offset());
             }
 
-            // --- FOOTER (fixed 12 bytes: 8 for offset, 4 for count) ---
+            // --- FOOTER (fixed 20 bytes) ---
+            out.writeLong(bloomFilterOffset);
             out.writeLong(indexBlockOffset);
             out.writeInt(indexEntries.size());
         }
@@ -78,7 +91,5 @@ public class SSTableWriter {
         return 4 + key.length + 4 + value.length;
     }
 
-    /** A single sparse index entry: a key, and the byte offset in the
-     * data block where that key's full entry begins. */
     record IndexEntry(byte[] key, long offset) {}
 }
