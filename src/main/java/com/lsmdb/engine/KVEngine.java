@@ -1,109 +1,188 @@
 package com.lsmdb.engine;
 
+import java.io.Closeable;
+import java.io.File;
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.List;
+
+import com.lsmdb.sstable.SSTableReader;
+import com.lsmdb.sstable.SSTableWriter;
 import com.lsmdb.storage.MemTable;
 import com.lsmdb.wal.WalEntry;
 import com.lsmdb.wal.WriteAheadLog;
 
-import java.io.Closeable;
-import java.io.File;
-import java.io.IOException;
-import java.util.List;
-
 /**
- * KVEngine: the first "real" end-to-end piece of the database.
+ * KVEngine: the full write/read path, tying together MemTable (Phase 1),
+ * WriteAheadLog (Phase 2), and SSTables (Phase 3).
  *
- * Ties MemTable (Phase 1) and WriteAheadLog (Phase 2) together into a
- * single unit that is actually crash-recoverable — which neither piece
- * was capable of on its own.
+ * This is now a directory-based engine: it owns a folder containing one
+ * WAL file plus zero or more immutable .sst files, one per flush.
  *
- * The critical invariant this class enforces:
- *   A write is only ever applied to the MemTable AFTER it has been
- *   durably logged to the WAL (fsynced to disk). This guarantees that if
- *   the process crashes at any point, replaying the WAL on the next
- *   startup reconstructs exactly the state that existed at crash time —
- *   no more, no less.
+ * Write path:
+ *   put/delete -> WAL (durable) -> MemTable -> (if MemTable is now too
+ *   big) flush MemTable to a new SSTable, then reset MemTable and WAL.
  *
- * This class does NOT yet flush the MemTable to disk as an SSTable, and
- * does NOT yet cap MemTable size — that's Phase 3. Right now, this is
- * "durable in-memory KV store," which is already a meaningful milestone:
- * it survives a process crash, which a bare MemTable cannot.
+ * Read path:
+ *   check MemTable (freshest) -> check SSTables newest to oldest ->
+ *   first match found (including a tombstone) wins and we stop looking,
+ *   since a newer entry always shadows an older one for the same key.
  */
 public class KVEngine implements Closeable {
 
-    private final WriteAheadLog wal;
-    private final MemTable memTable;
+    private static final String WAL_FILENAME = "wal.log";
 
-    private KVEngine(WriteAheadLog wal, MemTable memTable) {
+    private final File dbDir;
+    private final File walFile;
+    private final long flushThresholdBytes;
+
+    private WriteAheadLog wal;
+    private MemTable memTable;
+
+    // Newest SSTable first. Order matters directly for read correctness —
+    // see get().
+    private final List<SSTableReader> sstableReaders;
+    private int nextSSTableId;
+
+    private KVEngine(File dbDir, File walFile, long flushThresholdBytes,
+                      WriteAheadLog wal, MemTable memTable,
+                      List<SSTableReader> sstableReaders, int nextSSTableId) {
+        this.dbDir = dbDir;
+        this.walFile = walFile;
+        this.flushThresholdBytes = flushThresholdBytes;
         this.wal = wal;
         this.memTable = memTable;
+        this.sstableReaders = sstableReaders;
+        this.nextSSTableId = nextSSTableId;
     }
 
     /**
-     * Opens the engine against a WAL file on disk. If the file already
-     * exists (from a previous run, possibly one that crashed), its
-     * contents are replayed to rebuild MemTable state before this method
-     * returns — so by the time open() completes, the engine is exactly
-     * as if it had never gone down.
+     * Opens (or creates) the engine in the given directory.
+     *
+     * Recovery on startup, in order:
+     *   1. Open every existing .sst file found in dbDir — each one is
+     *      already durable and immutable, so we just need readers for
+     *      them, no replay needed.
+     *   2. Replay the (small) WAL into a fresh MemTable — this covers
+     *      only writes since the LAST flush, which is exactly why
+     *      flushing truncates the WAL: it keeps this replay step cheap
+     *      forever, instead of growing with the database's entire history.
      */
-    public static KVEngine open(File walFile) throws IOException {
-        MemTable memTable = new MemTable();
+    public static KVEngine open(File dbDir, long flushThresholdBytes) throws IOException {
+        if (!dbDir.exists()) {
+            dbDir.mkdirs();
+        }
 
-        // Recovery step: replay whatever was already durably logged,
-        // in the exact order it was originally written, so MemTable ends
-        // up in the same state it was in right before shutdown/crash.
+        // --- Step 1: discover existing SSTables ---
+        File[] sstFiles = dbDir.listFiles((d, name) -> name.endsWith(".sst"));
+        List<File> sortedSstFiles = new ArrayList<>();
+        if (sstFiles != null) {
+            for (File f : sstFiles) sortedSstFiles.add(f);
+        }
+        // Zero-padded numeric filenames sort correctly as plain strings —
+        // ascending here means oldest-to-newest.
+        sortedSstFiles.sort(Comparator.comparing(File::getName));
+
+        List<SSTableReader> readers = new ArrayList<>();
+        int maxId = 0;
+        for (File f : sortedSstFiles) {
+            readers.add(0, SSTableReader.open(f)); // insert at front -> newest ends up first
+            int id = Integer.parseInt(f.getName().replace(".sst", ""));
+            maxId = Math.max(maxId, id);
+        }
+
+        // --- Step 2: replay the WAL into a fresh MemTable ---
+        File walFile = new File(dbDir, WAL_FILENAME);
+        MemTable memTable = new MemTable();
         List<WalEntry> entries = WriteAheadLog.replay(walFile);
         for (WalEntry entry : entries) {
             if (entry.isPut()) {
                 memTable.put(entry.key, entry.value);
             } else if (entry.isDelete()) {
-                // Must go through delete(), not a raw removal — this
-                // writes a tombstone, preserving the same "deleted, not
-                // absent" semantics we'd have gotten from a live delete()
-                // call. This matters once SSTables exist: a replayed
-                // delete must still be able to shadow older on-disk data.
                 memTable.delete(entry.key);
             }
         }
-
-        // Only now, after recovery has rebuilt state, do we open the WAL
-        // for further appends. It's opened in append mode (see
-        // WriteAheadLog constructor), so replayed data is never touched.
         WriteAheadLog wal = new WriteAheadLog(walFile);
-        return new KVEngine(wal, memTable);
+
+        return new KVEngine(dbDir, walFile, flushThresholdBytes, wal, memTable, readers, maxId + 1);
     }
 
-    /**
-     * Writes a key-value pair. Returns only after the write is durable —
-     * WAL append + fsync happens before MemTable is touched.
-     */
-    public void put(byte[] key, byte[] value) throws IOException {
-        wal.appendPut(key, value);   // durable first
-        memTable.put(key, value);    // then visible to reads
+    public synchronized void put(byte[] key, byte[] value) throws IOException {
+        wal.appendPut(key, value);
+        memTable.put(key, value);
+        flushIfNeeded();
     }
 
-    /**
-     * Deletes a key. Same durability-first ordering as put().
-     */
-    public void delete(byte[] key) throws IOException {
+    public synchronized void delete(byte[] key) throws IOException {
         wal.appendDelete(key);
         memTable.delete(key);
+        flushIfNeeded();
     }
 
     /**
-     * Reads a key. Returns null if the key doesn't exist OR was deleted —
-     * from the outside, callers don't need to know about tombstones,
-     * that's an internal MemTable/SSTable implementation detail.
+     * Reads a key. Checks MemTable first (it always has the freshest
+     * data), then SSTables from NEWEST to OLDEST. The first match found
+     * anywhere — even if it's a tombstone — is authoritative, and we
+     * stop looking immediately. This is what makes a delete correctly
+     * shadow a stale value sitting in an older SSTable: the newer
+     * tombstone is found first and wins, and we never even look at the
+     * older file.
      */
-    public byte[] get(byte[] key) {
+    public synchronized byte[] get(byte[] key) throws IOException {
         byte[] value = memTable.get(key);
-        if (value == null || MemTable.isTombstone(value)) {
-            return null;
+        if (value != null) {
+            return MemTable.isTombstone(value) ? null : value;
         }
-        return value;
+
+        for (SSTableReader reader : sstableReaders) {
+            value = reader.get(key);
+            if (value != null) {
+                return MemTable.isTombstone(value) ? null : value;
+            }
+        }
+
+        return null; // genuinely not found anywhere
+    }
+
+    /**
+     * Checks whether the MemTable has crossed the configured size
+     * threshold, and if so, flushes it to a new immutable SSTable file,
+     * then resets both the MemTable and the WAL.
+     */
+    private void flushIfNeeded() throws IOException {
+        if (memTable.approximateSizeBytes() < flushThresholdBytes) {
+            return;
+        }
+
+        // Write everything currently in the MemTable to a new,
+        // immutable SSTable file on disk.
+        File sstFile = new File(dbDir, String.format("%010d.sst", nextSSTableId++));
+        SSTableWriter.flush(memTable, sstFile);
+
+        // Newest SSTable must be checked FIRST on reads, so it goes at
+        // the front of the list.
+        sstableReaders.add(0, SSTableReader.open(sstFile));
+
+        // The MemTable's contents are now durable inside the SSTable we
+        // just wrote. That means every WAL record that produced this
+        // MemTable is now redundant — safe to discard and start clean.
+        // This is the step that keeps WAL replay cheap forever, instead
+        // of growing with the database's entire lifetime history.
+        wal.close();
+        if (!walFile.delete()) {
+            throw new IOException("Failed to delete old WAL file after flush: " + walFile);
+        }
+        wal = new WriteAheadLog(walFile);
+
+        memTable = new MemTable();
     }
 
     @Override
-    public void close() throws IOException {
+    public synchronized void close() throws IOException {
         wal.close();
+        for (SSTableReader reader : sstableReaders) {
+            reader.close();
+        }
     }
 }
