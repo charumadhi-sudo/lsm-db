@@ -165,4 +165,32 @@ public class SkipList {
         }
         return true;
     }
+
+    /**
+     * Returns every node in ascending key order, by walking level 0 —
+     * the "bottom rail" that always contains every single element,
+     * regardless of what shortcuts exist on higher levels.
+     *
+     * This is what makes flushing a MemTable to an SSTable possible:
+     * an SSTable's data block must be written in sorted order, and this
+     * gives us exactly that, in O(n) with no extra sorting needed — the
+     * skip list is already sorted by construction.
+     */
+    public Iterable<SkipListNode> entriesInOrder() {
+        return () -> new java.util.Iterator<>() {
+            SkipListNode current = head.forward[0];
+
+            @Override
+            public boolean hasNext() {
+                return current != null;
+            }
+
+            @Override
+            public SkipListNode next() {
+                SkipListNode node = current;
+                current = current.forward[0];
+                return node;
+            }
+        };
+    }
 }

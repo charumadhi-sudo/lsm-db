@@ -67,4 +67,25 @@ public class MemTable {
     public long approximateSizeBytes() {
         return approximateSizeBytes;
     }
+
+    /**
+     * A single (key, value) pair, used when iterating the whole MemTable
+     * in sorted order — e.g. to flush it to an SSTable. Value may be
+     * the TOMBSTONE marker; callers that care must check isTombstone().
+     */
+    public record Entry(byte[] key, byte[] value) {}
+
+    /**
+     * Returns every entry in ascending key order, tombstones included.
+     * Tombstones are deliberately NOT filtered out here — when this gets
+     * flushed to an SSTable, the tombstone must be written to disk too,
+     * so it can shadow stale values sitting in older SSTables.
+     */
+    public Iterable<Entry> entriesInOrder() {
+        java.util.List<Entry> result = new java.util.ArrayList<>();
+        for (SkipListNode node : skipList.entriesInOrder()) {
+            result.add(new Entry(node.key, node.value));
+        }
+        return result;
+    }
 }
