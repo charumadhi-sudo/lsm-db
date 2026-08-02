@@ -7,6 +7,7 @@ import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
 
+import com.lsmdb.compaction.CompactionManager;
 import com.lsmdb.sstable.SSTableReader;
 import com.lsmdb.sstable.SSTableWriter;
 import com.lsmdb.storage.MemTable;
@@ -32,6 +33,11 @@ import com.lsmdb.wal.WriteAheadLog;
 public class KVEngine implements Closeable {
 
     private static final String WAL_FILENAME = "wal.log";
+    // Once this many SSTable files exist, compact ALL of them into one.
+    // Simplified size-tiered strategy: real engines use more nuanced
+    // triggers (total size, level-based budgets), but "too many small
+    // files" is the same underlying signal this is approximating.
+    private static final int MAX_SSTABLES_BEFORE_COMPACTION = 4;
 
     private final File dbDir;
     private final File walFile;
@@ -176,6 +182,41 @@ public class KVEngine implements Closeable {
         wal = new WriteAheadLog(walFile);
 
         memTable = new MemTable();
+
+        compactIfNeeded();
+    }
+
+    /**
+     * If too many SSTable files have piled up, merge them ALL into a
+     * single new one via CompactionManager, then discard the old files.
+     *
+     * Because this compacts EVERY existing SSTable at once (not a
+     * partial subset, as a leveled strategy would), there is no older
+     * data left anywhere that a tombstone could still need to shadow —
+     * so we pass dropTombstones=true, letting deleted keys finally be
+     * reclaimed for real instead of persisting forever as markers.
+     */
+    private void compactIfNeeded() throws IOException {
+        if (sstableReaders.size() < MAX_SSTABLES_BEFORE_COMPACTION) {
+            return;
+        }
+
+        File mergedFile = new File(dbDir, String.format("%010d.sst", nextSSTableId++));
+        CompactionManager.compact(sstableReaders, mergedFile, true);
+
+        // Every old SSTable's data now lives inside mergedFile. Close
+        // and delete them — order matters: close (release the file
+        // handle) before delete (some platforms, notably Windows,
+        // refuse to delete a file that's still open).
+        for (SSTableReader oldReader : sstableReaders) {
+            File oldFile = oldReader.file();
+            oldReader.close();
+            if (!oldFile.delete()) {
+                throw new IOException("Failed to delete compacted SSTable: " + oldFile);
+            }
+        }
+        sstableReaders.clear();
+        sstableReaders.add(SSTableReader.open(mergedFile));
     }
 
     @Override

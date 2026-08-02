@@ -18,16 +18,24 @@ import com.lsmdb.bloom.BloomFilter;
 public class SSTableReader implements Closeable {
 
     private final RandomAccessFile file;
+    private final File sourceFile;
     private final List<SSTableWriter.IndexEntry> index; // sorted by key, in RAM
     private final long bloomFilterOffset; // == where the data block ends
     private final BloomFilter bloomFilter;
 
-    private SSTableReader(RandomAccessFile file, List<SSTableWriter.IndexEntry> index,
+    private SSTableReader(RandomAccessFile file, File sourceFile, List<SSTableWriter.IndexEntry> index,
                            long bloomFilterOffset, BloomFilter bloomFilter) {
         this.file = file;
+        this.sourceFile = sourceFile;
         this.index = index;
         this.bloomFilterOffset = bloomFilterOffset;
         this.bloomFilter = bloomFilter;
+    }
+
+    /** The on-disk file this reader was opened from — needed by
+     * KVEngine to delete old files once they've been compacted away. */
+    public File file() {
+        return sourceFile;
     }
 
     public static SSTableReader open(File sstableFile) throws IOException {
@@ -61,7 +69,7 @@ public class SSTableReader implements Closeable {
             index.add(new SSTableWriter.IndexEntry(key, offset));
         }
 
-        return new SSTableReader(raf, index, bloomFilterOffset, bloomFilter);
+        return new SSTableReader(raf, sstableFile, index, bloomFilterOffset, bloomFilter);
     }
 
     /**
@@ -129,6 +137,28 @@ public class SSTableReader implements Closeable {
             } else {
                 hi = mid - 1;
             }
+        }
+        return result;
+    }
+
+    /**
+     * Reads every entry in this SSTable, in sorted key order, from the
+     * data block start (offset 0) through to where the bloom filter
+     * block begins. Unlike get(), this is a full sequential scan — used
+     * by compaction, which needs to see everything in every file being
+     * merged, not just look up one key.
+     */
+    public synchronized List<com.lsmdb.storage.MemTable.Entry> readAllEntries() throws IOException {
+        List<com.lsmdb.storage.MemTable.Entry> result = new ArrayList<>();
+        file.seek(0);
+        while (file.getFilePointer() < bloomFilterOffset) {
+            int keyLen = file.readInt();
+            byte[] key = new byte[keyLen];
+            file.readFully(key);
+            int valueLen = file.readInt();
+            byte[] value = new byte[valueLen];
+            file.readFully(value);
+            result.add(new com.lsmdb.storage.MemTable.Entry(key, value));
         }
         return result;
     }
